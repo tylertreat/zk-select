@@ -3,6 +3,7 @@ package zkselect
 import (
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"strings"
 	"time"
@@ -11,10 +12,13 @@ import (
 )
 
 const (
-	root     = "/zkselect"
-	queue    = "/queue"
-	lock     = "/lock"
-	selected = "/selected"
+	zRoot         = "/zkselect"
+	zQueue        = "/queue"
+	zLock         = "/lock"
+	zTxn          = "/txn"
+	zSelected     = "/selected"
+	zParticipants = "/participants"
+	zDone         = "/done"
 )
 
 var (
@@ -29,10 +33,16 @@ type Client struct {
 	clientID string
 	hosts    []string
 	zk       *zk.Conn
+	rand     *rand.Rand
 }
 
 func New(clientID string, zkHosts []string) *Client {
-	return &Client{clientID: clientID, hosts: zkHosts}
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	return &Client{
+		clientID: clientID,
+		hosts:    zkHosts,
+		rand:     r,
+	}
 }
 
 func (c *Client) Dial() error {
@@ -46,19 +56,19 @@ func (c *Client) Dial() error {
 	}
 	c.zk = conn
 
-	if _, err := c.createIfNotExists(root, nil, 0, acl); err != nil {
+	if _, err := c.createIfNotExists(zRoot, nil, 0, acl); err != nil {
 		c.Close()
 		return err
 	}
-	if _, err := c.createIfNotExists(root+queue, nil, 0, acl); err != nil {
+	if _, err := c.createIfNotExists(zRoot+zQueue, nil, 0, acl); err != nil {
 		c.Close()
 		return err
 	}
-	if _, err := c.createIfNotExists(root+lock, nil, 0, acl); err != nil {
+	if _, err := c.createIfNotExists(zRoot+zLock, nil, 0, acl); err != nil {
 		c.Close()
 		return err
 	}
-	if _, err := c.createIfNotExists(root+selected, nil, 0, acl); err != nil {
+	if _, err := c.createIfNotExists(zRoot+zTxn, nil, 0, acl); err != nil {
 		c.Close()
 		return err
 	}
@@ -80,17 +90,17 @@ func (c *Client) Subscribe(id, queue string) error {
 		return err
 	}
 
-	if _, err := c.createIfNotExists(root+queue, nil, 0, acl); err != nil {
+	if _, err := c.createIfNotExists(fmt.Sprintf("%s%s/%s", zRoot, zQueue, queue), nil, 0, acl); err != nil {
 		return err
 	}
 
-	lock := zk.NewLock(c.zk, root+lock, acl)
+	lock := zk.NewLock(c.zk, zRoot+zLock, acl)
 	if err := lock.Lock(); err != nil {
 		return err
 	}
 	defer lock.Unlock()
 
-	zNode := fmt.Sprintf("%s%s/%s-%s", root, queue, c.clientID, id)
+	zNode := fmt.Sprintf("%s%s/%s/%s-%s", zRoot, zQueue, queue, c.clientID, id)
 	if _, err := c.createIfNotExists(zNode, nil, zk.FlagEphemeral, acl); err != nil {
 		return err
 	}
@@ -103,45 +113,159 @@ func (c *Client) Select(queue, msgID string) (string, error) {
 		return "", err
 	}
 
-	lock := zk.NewLock(c.zk, root+lock, acl)
+	lock := zk.NewLock(c.zk, zRoot+zLock, acl)
 	if err := lock.Lock(); err != nil {
 		return "", err
 	}
 	defer lock.Unlock()
 
-	selectZNode := fmt.Sprintf("%s%s/%s/%s", root, selected, queue, msgID)
-	children, _, err := c.zk.Children(selectZNode)
-	if err == nil && len(children) > 0 {
-		return c.selectAndClear(selectZNode, children[0])
-	}
-	if _, err := c.zk.Create(selectZNode, nil, 0, acl); err != nil {
+	txnZNode := fmt.Sprintf("%s%s/%s", zRoot, zTxn, msgID)
+	if _, err := c.zk.Sync(txnZNode); err != nil {
 		return "", err
 	}
-
-	if _, err := c.zk.Sync(root + queue); err != nil {
-		return "", err
-	}
-	children, _, err = c.zk.Children(root + queue)
+	exists, _, err := c.zk.Exists(txnZNode)
 	if err != nil {
 		return "", err
 	}
-	if len(children) == 0 {
-		return "", ErrNoSelection
+
+	defer c.mark(msgID)
+	if exists {
+		return c.getSelected(msgID)
 	}
-	selected := children[rand.Intn(len(children))]
-	if _, err := c.zk.Create(fmt.Sprintf("%s/%s", selectZNode, selected), nil, 0, acl); err != nil {
+
+	if err := c.createTxn(queue, msgID); err != nil {
 		return "", err
 	}
 
-	return c.selectAndClear(selectZNode, selected)
-}
+	selected, err := c.selectCandidate(queue)
+	if err != nil {
+		return "", err
+	}
 
-func (c *Client) selectAndClear(path, node string) (string, error) {
-	clientAndID := strings.Split(node, "-")
+	if _, err := c.zk.Create(fmt.Sprintf("%s%s/%s", txnZNode, zSelected, selected), nil, 0, acl); err != nil {
+		return "", err
+	}
+
+	clientAndID := strings.Split(selected, "-")
 	if clientAndID[0] != c.clientID {
 		return "", ErrNoSelection
 	}
 	return clientAndID[1], nil
+}
+
+func (c *Client) createTxn(queue, msgID string) error {
+	txnZNode := fmt.Sprintf("%s%s/%s", zRoot, zTxn, msgID)
+	if _, err := c.zk.Create(txnZNode, nil, 0, acl); err != nil {
+		return err
+	}
+	if _, err := c.zk.Create(txnZNode+zSelected, nil, 0, acl); err != nil {
+		return err
+	}
+	if _, err := c.zk.Create(txnZNode+zDone, nil, 0, acl); err != nil {
+		return err
+	}
+	if _, err := c.zk.Create(txnZNode+zParticipants, nil, 0, acl); err != nil {
+		return err
+	}
+	candidates, err := c.getCandidates(queue)
+	if err != nil {
+		return err
+	}
+	clients := make(map[string]bool)
+	for _, candidate := range candidates {
+		clients[strings.Split(candidate, "-")[0]] = true
+	}
+	for client, _ := range clients {
+		if _, err := c.zk.Create(fmt.Sprintf("%s%s/%s", txnZNode, zParticipants, client), nil, 0, acl); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Client) selectCandidate(queue string) (string, error) {
+	candidates, err := c.getCandidates(queue)
+	if err != nil {
+		return "", err
+	}
+	if len(candidates) == 0 {
+		return "", ErrNoSelection
+	}
+	return candidates[c.rand.Intn(len(candidates))], nil
+}
+
+func (c *Client) getSelected(msgID string) (string, error) {
+	txnZNode := fmt.Sprintf("%s%s/%s", zRoot, zTxn, msgID)
+	selected, _, err := c.zk.Children(txnZNode + zSelected)
+	if err != nil {
+		return "", err
+	}
+	clientAndID := strings.Split(selected[0], "-")
+	if clientAndID[0] != c.clientID {
+		return "", ErrNoSelection
+	}
+	return clientAndID[1], nil
+}
+
+func (c *Client) mark(msgID string) error {
+	if err := c.setDone(msgID); err != nil {
+		return err
+	}
+	done, err := c.isTxnDone(msgID)
+	if err != nil {
+		return err
+	}
+	if done {
+		log.Println("Deleting txn", msgID)
+		txnZNode := fmt.Sprintf("%s%s/%s", zRoot, zTxn, msgID)
+		return c.deleteRecursive(txnZNode)
+	}
+	return nil
+}
+
+func (c *Client) setDone(msgID string) error {
+	txnZNode := fmt.Sprintf("%s%s/%s", zRoot, zTxn, msgID)
+	_, err := c.zk.Create(fmt.Sprintf("%s%s/%s", txnZNode, zDone, c.clientID), nil, 0, acl)
+	return err
+}
+
+func (c *Client) isTxnDone(msgID string) (bool, error) {
+	done, err := c.getDone(msgID)
+	if err != nil {
+		return false, err
+	}
+	participants, err := c.getParticipants(msgID)
+	if err != nil {
+		return false, err
+	}
+	return len(done) == len(participants), nil
+}
+
+func (c *Client) getDone(msgID string) ([]string, error) {
+	txnZNode := fmt.Sprintf("%s%s/%s", zRoot, zTxn, msgID)
+	done, _, err := c.zk.Children(txnZNode + zDone)
+	if err != nil {
+		return nil, err
+	}
+	return done, nil
+}
+
+func (c *Client) getParticipants(msgID string) ([]string, error) {
+	txnZNode := fmt.Sprintf("%s%s/%s", zRoot, zTxn, msgID)
+	participants, _, err := c.zk.Children(txnZNode + zParticipants)
+	if err != nil {
+		return nil, err
+	}
+	return participants, nil
+}
+
+func (c *Client) getCandidates(queue string) ([]string, error) {
+	candidatesZNode := fmt.Sprintf("%s%s/%s", zRoot, zQueue, queue)
+	candidates, _, err := c.zk.Children(candidatesZNode)
+	if err != nil {
+		return nil, err
+	}
+	return candidates, nil
 }
 
 func (c *Client) createIfNotExists(path string, data []byte, flags int32, acl []zk.ACL) (string, error) {
@@ -153,6 +277,19 @@ func (c *Client) createIfNotExists(path string, data []byte, flags int32, acl []
 		return path, nil
 	}
 	return c.zk.Create(path, data, flags, acl)
+}
+
+func (c *Client) deleteRecursive(path string) error {
+	children, _, err := c.zk.Children(path)
+	if err != nil {
+		return err
+	}
+	for _, child := range children {
+		if err := c.deleteRecursive(child); err != nil {
+			return err
+		}
+	}
+	return c.zk.Delete(path, -1)
 }
 
 func (c *Client) assertConnected() error {
